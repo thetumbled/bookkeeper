@@ -35,6 +35,7 @@ import java.util.concurrent.TimeUnit;
 import org.apache.bookkeeper.client.api.BKException.Code;
 import org.apache.bookkeeper.common.testing.executors.MockExecutorController;
 import org.apache.bookkeeper.util.ZkUtils;
+import org.apache.zookeeper.AddWatchMode;
 import org.apache.zookeeper.AsyncCallback.Children2Callback;
 import org.apache.zookeeper.AsyncCallback.DataCallback;
 import org.apache.zookeeper.AsyncCallback.StatCallback;
@@ -56,6 +57,7 @@ import org.mockito.MockedStatic;
 public abstract class MockZooKeeperTestCase {
 
     protected final ConcurrentMap<String, Set<Watcher>> watchers = Maps.newConcurrentMap();
+    protected final ConcurrentMap<String, Set<Watcher>> persistentRecursiveWatchers = Maps.newConcurrentMap();
     protected ZooKeeper mockZk;
     protected ScheduledExecutorService zkCallbackExecutor;
     protected MockExecutorController zkCallbackController;
@@ -301,6 +303,61 @@ public abstract class MockZooKeeperTestCase {
             expectedWatcher ? any(Watcher.class) : eq(null),
             any(Children2Callback.class),
             any());
+    }
+
+    /**
+     * Mock addWatch for persistent recursive watch support.
+     * The watcher will be stored and can be triggered for any path under the watched path.
+     */
+    protected void mockAddWatch(String expectedPath,
+                                int retCode) {
+        doAnswer(invocationOnMock -> {
+            String path = invocationOnMock.getArgument(0);
+            Watcher watcher = invocationOnMock.getArgument(1);
+            AddWatchMode mode = invocationOnMock.getArgument(2);
+            VoidCallback callback = invocationOnMock.getArgument(3);
+            Object ctx = invocationOnMock.getArgument(4);
+
+            if (mode == AddWatchMode.PERSISTENT_RECURSIVE && retCode == KeeperException.Code.OK.intValue()) {
+                Set<Watcher> watcherSet = persistentRecursiveWatchers.get(path);
+                if (null == watcherSet) {
+                    watcherSet = new HashSet<>();
+                    persistentRecursiveWatchers.put(path, watcherSet);
+                }
+                watcherSet.add(watcher);
+            }
+
+            callback.processResult(retCode, path, ctx);
+            return null;
+        }).when(mockZk).addWatch(
+            eq(expectedPath),
+            any(Watcher.class),
+            any(AddWatchMode.class),
+            any(VoidCallback.class),
+            any());
+    }
+
+    /**
+     * Notify persistent recursive watcher for a path.
+     * This simulates events on any node under the watched path.
+     */
+    protected boolean notifyPersistentRecursiveWatcher(EventType eventType,
+                                                       KeeperState keeperState,
+                                                       String path) {
+        // Find the persistent recursive watcher for the parent path
+        for (String watchedPath : persistentRecursiveWatchers.keySet()) {
+            if (path.startsWith(watchedPath + "/") || path.equals(watchedPath)) {
+                Set<Watcher> watcherSet = persistentRecursiveWatchers.get(watchedPath);
+                if (watcherSet != null) {
+                    WatchedEvent event = new WatchedEvent(eventType, keeperState, path);
+                    for (Watcher watcher : watcherSet) {
+                        watcher.process(event);
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
 }
