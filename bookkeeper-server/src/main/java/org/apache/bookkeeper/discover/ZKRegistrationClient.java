@@ -49,6 +49,8 @@ import org.apache.bookkeeper.versioning.LongVersion;
 import org.apache.bookkeeper.versioning.Version;
 import org.apache.bookkeeper.versioning.Version.Occurred;
 import org.apache.bookkeeper.versioning.Versioned;
+import org.apache.zookeeper.AddWatchMode;
+import org.apache.zookeeper.AsyncCallback;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.Watcher;
@@ -181,12 +183,14 @@ public class ZKRegistrationClient implements RegistrationClient {
     private WatchTask watchReadOnlyBookiesTask = null;
     private final ConcurrentHashMap<BookieId, Versioned<BookieServiceInfo>> bookieServiceInfoCache =
                                                                             new ConcurrentHashMap<>();
-    private final Watcher bookieServiceInfoCacheInvalidation;
     private final boolean bookieAddressTracking;
     // registration paths
     private final String bookieRegistrationPath;
     private final String bookieAllRegistrationPath;
     private final String bookieReadonlyRegistrationPath;
+    // Persistent recursive watch for bookie nodes
+    private volatile int persistentWatchCount = 0; // Track how many watches are established (0, 1, or 2)
+    private final PersistentRecursiveWatcher persistentRecursiveWatcher;
 
     public ZKRegistrationClient(ZooKeeper zk,
                                 String ledgersRootPath,
@@ -199,11 +203,15 @@ public class ZKRegistrationClient implements RegistrationClient {
         // we can disable this feature, in case the BK cluster has only
         // static addresses
         this.bookieAddressTracking = bookieAddressTracking;
-        this.bookieServiceInfoCacheInvalidation = bookieAddressTracking
-                                                    ? new BookieServiceInfoCacheInvalidationWatcher() : null;
         this.bookieRegistrationPath = ledgersRootPath + "/" + AVAILABLE_NODE;
         this.bookieAllRegistrationPath = ledgersRootPath + "/" + COOKIE_NODE;
         this.bookieReadonlyRegistrationPath = this.bookieRegistrationPath + "/" + READONLY;
+        
+        if (bookieAddressTracking) {
+            this.persistentRecursiveWatcher = new PersistentRecursiveWatcher();
+        } else {
+            this.persistentRecursiveWatcher = null;
+        }
     }
 
     @Override
@@ -250,6 +258,7 @@ public class ZKRegistrationClient implements RegistrationClient {
         }
     }
 
+
     /**
      * Read BookieServiceInfo from ZooKeeper and updates the local cache.
      *
@@ -261,7 +270,8 @@ public class ZKRegistrationClient implements RegistrationClient {
         String pathAsReadonly = bookieReadonlyRegistrationPath + "/" + bookieId;
 
         CompletableFuture<Versioned<BookieServiceInfo>> promise = new CompletableFuture<>();
-        zk.getData(pathAsWritable, bookieServiceInfoCacheInvalidation,
+        // No watcher needed - using persistent recursive watch on parent node
+        zk.getData(pathAsWritable, null,
                 (int rc, String path, Object o, byte[] bytes, Stat stat) -> {
             if (KeeperException.Code.OK.intValue() == rc) {
                 try {
@@ -273,13 +283,14 @@ public class ZKRegistrationClient implements RegistrationClient {
                     promise.complete(result);
                 } catch (IOException ex) {
                     log.error("Cannot update BookieInfo for ", ex);
-                    promise.completeExceptionally(KeeperException.create(KeeperException.Code.get(rc), path)
-                            .initCause(ex));
+                    promise.completeExceptionally(KeeperException.create(
+                            KeeperException.Code.DATAINCONSISTENCY, path).initCause(ex));
                     return;
                 }
             } else if (KeeperException.Code.NONODE.intValue() == rc) {
                 // not found, looking for a readonly bookie
-                zk.getData(pathAsReadonly, bookieServiceInfoCacheInvalidation,
+                // No watcher needed - using persistent recursive watch on parent node
+                zk.getData(pathAsReadonly, null,
                         (int rc2, String path2, Object o2, byte[] bytes2, Stat stat2) -> {
                     if (KeeperException.Code.OK.intValue() == rc2) {
                         try {
@@ -291,8 +302,8 @@ public class ZKRegistrationClient implements RegistrationClient {
                             promise.complete(result);
                         } catch (IOException ex) {
                             log.error("Cannot update BookieInfo for ", ex);
-                            promise.completeExceptionally(KeeperException.create(KeeperException.Code.get(rc2), path2)
-                                    .initCause(ex));
+                            promise.completeExceptionally(KeeperException.create(
+                                    KeeperException.Code.DATAINCONSISTENCY, path2).initCause(ex));
                             return;
                         }
                     } else {
@@ -307,7 +318,6 @@ public class ZKRegistrationClient implements RegistrationClient {
         return promise;
     }
 
-    @SuppressWarnings("unchecked")
     @VisibleForTesting
     static BookieServiceInfo deserializeBookieServiceInfo(BookieId bookieId, byte[] bookieServiceInfo)
             throws IOException {
@@ -397,6 +407,10 @@ public class ZKRegistrationClient implements RegistrationClient {
         watchWritableBookiesTask.addListener(listener);
         if (watchWritableBookiesTask.getNumListeners() == 1) {
             watchWritableBookiesTask.watch();
+            // Establish persistent recursive watch when first listener is added
+            if (bookieAddressTracking && persistentWatchCount < 2) {
+                establishPersistentRecursiveWatch();
+            }
         }
         return f;
     }
@@ -432,6 +446,10 @@ public class ZKRegistrationClient implements RegistrationClient {
         watchReadOnlyBookiesTask.addListener(listener);
         if (watchReadOnlyBookiesTask.getNumListeners() == 1) {
             watchReadOnlyBookiesTask.watch();
+            // Establish persistent recursive watch when first listener is added
+            if (bookieAddressTracking && persistentWatchCount < 2) {
+                establishPersistentRecursiveWatch();
+            }
         }
         return f;
     }
@@ -477,37 +495,201 @@ public class ZKRegistrationClient implements RegistrationClient {
         return null;
     }
 
-    private class BookieServiceInfoCacheInvalidationWatcher implements Watcher {
-
+    /**
+     * Persistent recursive watcher that handles all events for bookie nodes.
+     * This watcher is set once on the parent node and automatically monitors
+     * all child nodes (existing and future) for creation, deletion, and data changes.
+     * This achieves O(1) watch complexity instead of O(N^2).
+     */
+    private class PersistentRecursiveWatcher implements Watcher {
+        
         @Override
-        public void process(WatchedEvent we) {
+        public void process(WatchedEvent event) {
             if (log.isDebugEnabled()) {
-                log.debug("zk event {} for {} state {}", we.getType(), we.getPath(), we.getState());
+                log.debug("Persistent recursive watch event: type={}, path={}, state={}", 
+                    event.getType(), event.getPath(), event.getState());
             }
-            if (we.getState() == KeeperState.Expired) {
-                log.info("zk session expired, invalidating cache");
-                bookieServiceInfoCache.clear();
+            
+            // Handle session state changes
+            if (event.getType() == EventType.None) {
+                if (event.getState() == KeeperState.Expired) {
+                    log.info("ZK session expired, invalidating cache and re-establishing watch");
+                    bookieServiceInfoCache.clear();
+                    persistentWatchCount = 0;
+                    // Re-establish watch when session is reconnected
+                    scheduleReestablishWatch();
+                }
                 return;
             }
-            BookieId bookieId = stripBookieIdFromPath(we.getPath());
+            
+            String path = event.getPath();
+            if (path == null) {
+                return;
+            }
+            
+            // Handle events for bookie nodes
+            BookieId bookieId = stripBookieIdFromPath(path);
             if (bookieId == null) {
+                // Not a bookie node, might be the parent node itself
+                if (path.equals(bookieRegistrationPath) || path.equals(bookieReadonlyRegistrationPath)) {
+                    // Parent node children changed, trigger WatchTask to refresh list
+                    handleParentNodeChildrenChanged(path);
+                }
                 return;
             }
-            switch (we.getType()) {
+            
+            // Process bookie node events
+            switch (event.getType()) {
+                case NodeCreated:
+                    log.info("Bookie node created: {}", bookieId);
+                    // New bookie appeared, read its data
+                    readBookieServiceInfoAsync(bookieId).whenComplete((info, throwable) -> {
+                        if (throwable != null && log.isDebugEnabled()) {
+                            log.debug("Failed to read bookie info for new bookie {}: {}", 
+                                bookieId, throwable.getMessage());
+                        }
+                    });
+                    // Trigger WatchTask to refresh bookie list
+                    handleBookieListChange();
+                    break;
+                    
                 case NodeDeleted:
-                    log.info("Invalidate cache for {}", bookieId);
+                    log.info("Bookie node deleted: {}", bookieId);
+                    // Bookie removed, invalidate cache
                     bookieServiceInfoCache.remove(bookieId);
+                    // Trigger WatchTask to refresh bookie list
+                    handleBookieListChange();
                     break;
+                    
                 case NodeDataChanged:
-                    log.info("refresh cache for {}", bookieId);
-                    readBookieServiceInfoAsync(bookieId);
+                    log.info("Bookie node data changed: {}", bookieId);
+                    // Bookie data changed, refresh cache
+                    readBookieServiceInfoAsync(bookieId).whenComplete((info, throwable) -> {
+                        if (throwable != null && log.isDebugEnabled()) {
+                            log.debug("Failed to refresh bookie info for {}: {}", 
+                                bookieId, throwable.getMessage());
+                        }
+                    });
                     break;
+                    
                 default:
                     if (log.isDebugEnabled()) {
-                        log.debug("ignore cache event {} for {}", we.getType(), bookieId);
+                        log.debug("Ignoring persistent recursive watch event type {} for {}", 
+                            event.getType(), bookieId);
                     }
                     break;
             }
+        }
+        
+        private void handleParentNodeChildrenChanged(String parentPath) {
+            // Trigger WatchTask to refresh the bookie list
+            scheduler.execute(() -> {
+                if (parentPath.equals(bookieRegistrationPath) && watchWritableBookiesTask != null) {
+                    watchWritableBookiesTask.run();
+                } else if (parentPath.equals(bookieReadonlyRegistrationPath) 
+                        && watchReadOnlyBookiesTask != null) {
+                    watchReadOnlyBookiesTask.run();
+                }
+            });
+        }
+        
+        private void handleBookieListChange() {
+            // Trigger both WatchTasks to refresh bookie lists
+            scheduler.execute(() -> {
+                if (watchWritableBookiesTask != null) {
+                    watchWritableBookiesTask.run();
+                }
+                if (watchReadOnlyBookiesTask != null) {
+                    watchReadOnlyBookiesTask.run();
+                }
+            });
+        }
+        
+        private void scheduleReestablishWatch() {
+            scheduler.schedule(() -> {
+                if (persistentWatchCount < 2 && bookieAddressTracking) {
+                    establishPersistentRecursiveWatch();
+                }
+            }, ZK_CONNECT_BACKOFF_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+    
+    /**
+     * Establish persistent recursive watch on parent nodes.
+     * This watch will automatically monitor all child nodes for changes.
+     */
+    private synchronized void establishPersistentRecursiveWatch() {
+        if (!bookieAddressTracking || persistentRecursiveWatcher == null || persistentWatchCount >= 2) {
+            return;
+        }
+        
+        try {
+            // Set persistent recursive watch on writable bookies path (if not already set)
+            if (persistentWatchCount == 0) {
+                zk.addWatch(bookieRegistrationPath, persistentRecursiveWatcher, 
+                    AddWatchMode.PERSISTENT_RECURSIVE, new AsyncCallback.VoidCallback() {
+                        @Override
+                        public void processResult(int rc, String path, Object ctx) {
+                            synchronized (ZKRegistrationClient.this) {
+                                if (rc == KeeperException.Code.OK.intValue()) {
+                                    log.info("Persistent recursive watch established on {}", path);
+                                    if (persistentWatchCount == 0) {
+                                        persistentWatchCount = 1;
+                                    }
+                                    // Try to establish the second watch
+                                    if (persistentWatchCount == 1) {
+                                        establishReadOnlyWatch();
+                                    }
+                                } else {
+                                    log.warn("Failed to establish persistent recursive watch on {}: {}", 
+                                        path, KeeperException.Code.get(rc));
+                                    // Retry after delay
+                                    scheduler.schedule(() -> establishPersistentRecursiveWatch(), 
+                                        ZK_CONNECT_BACKOFF_MS, TimeUnit.MILLISECONDS);
+                                }
+                            }
+                        }
+                    }, null);
+            }
+            
+            // Set persistent recursive watch on readonly bookies path (if writable watch is already set)
+            if (persistentWatchCount == 1) {
+                establishReadOnlyWatch();
+            }
+        } catch (Exception e) {
+            log.warn("Exception while establishing persistent recursive watch, will retry", e);
+            scheduler.schedule(() -> establishPersistentRecursiveWatch(), 
+                ZK_CONNECT_BACKOFF_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+    
+    private synchronized void establishReadOnlyWatch() {
+        if (persistentWatchCount != 1) {
+            return;
+        }
+        try {
+            zk.addWatch(bookieReadonlyRegistrationPath, persistentRecursiveWatcher, 
+                AddWatchMode.PERSISTENT_RECURSIVE, new AsyncCallback.VoidCallback() {
+                    @Override
+                    public void processResult(int rc, String path, Object ctx) {
+                        synchronized (ZKRegistrationClient.this) {
+                            if (rc == KeeperException.Code.OK.intValue()) {
+                                log.info("Persistent recursive watch established on {}", path);
+                                persistentWatchCount = 2;
+                            } else {
+                                log.warn("Failed to establish persistent recursive watch on {}: {}", 
+                                    path, KeeperException.Code.get(rc));
+                                // Retry after delay
+                                scheduler.schedule(() -> establishPersistentRecursiveWatch(), 
+                                    ZK_CONNECT_BACKOFF_MS, TimeUnit.MILLISECONDS);
+                            }
+                        }
+                    }
+                }, null);
+        } catch (Exception e) {
+            log.warn("Exception while establishing readonly persistent recursive watch, will retry", e);
+            scheduler.schedule(() -> establishPersistentRecursiveWatch(), 
+                ZK_CONNECT_BACKOFF_MS, TimeUnit.MILLISECONDS);
         }
     }
 
